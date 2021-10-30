@@ -86,14 +86,13 @@ async fn reconcile_job(
     client: kube::Client,
     now: Time,
 ) -> Result<ReconcilerAction, Error> {
-    // when schedule comes, create a job.
-    // and update status
     let schedule = Schedule::from_str(&cj.spec.schedule)?;
     let mut status = cj.status.clone().unwrap_or(KrustJobStatus::default());
     let last_schedule_time = status.last_schedule_time.as_ref().unwrap_or(&now);
     let mut it = schedule.after(&last_schedule_time.0);
     let next_time = it.next().unwrap();
 
+    // scheduled time hasn't come yet.
     if next_time > now.0 {
         return Ok(ReconcilerAction {
             requeue_after: Some(convert_duration(next_time - now.0)?),
