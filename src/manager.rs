@@ -5,7 +5,7 @@ use futures::{future::BoxFuture, FutureExt, StreamExt};
 use chrono::Utc;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference, Time};
-use kube::api::{ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, PropagationPolicy};
 use kube::{Api, Client, CustomResource, Resource};
 use kube_runtime::{
     controller::{Context, ReconcilerAction},
@@ -144,6 +144,15 @@ async fn reconcile_job(
 
     if cj.spec.concurrency_policy == ConcurrencyPolicy::Forbid && active_job_list.len() > 0 {
         return result;
+    }
+
+    if cj.spec.concurrency_policy == ConcurrencyPolicy::Replace {
+        let mut dp = DeleteParams::default();
+        dp.propagation_policy = Some(PropagationPolicy::Background);
+        for job in active_job_list {
+            jobs.delete(job.metadata.name.as_ref().unwrap(), &dp)
+                .await?;
+        }
     }
 
     let job = construct_job_for_cronjob(&cj, Time(next_time))?;
