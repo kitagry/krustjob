@@ -57,58 +57,20 @@ struct Data {
 }
 
 async fn reconcile(cj: KrustJob, ctx: Context<Data>) -> Result<ReconcilerAction, Error> {
-    // when schedule comes, create a job.
-    // and update status
-    let schedule = Schedule::from_str(&cj.spec.schedule)?;
     let now = Time(Utc::now());
-    let mut status = cj.status.clone().unwrap_or(KrustJobStatus::default());
-    let last_schedule_time = status.last_schedule_time.as_ref().unwrap_or(&now);
-    println!("{:?}", status.last_schedule_time);
-    let mut it = schedule.after(&last_schedule_time.0);
-    let next_time = it.next().unwrap();
-
-    let krustjobs = Api::<KrustJob>::namespaced(
-        ctx.get_ref().client.clone(),
-        &cj.metadata.namespace.as_ref().unwrap(),
-    );
+    let result = reconcile_job(&cj, ctx.get_ref().client.clone(), now.clone()).await?;
 
     let default_name = "".to_string();
-    if next_time > now.0 {
-        let pp = PatchParams::default();
-        let data = serde_json::json!({
-            "status": {
-                "last_schedule_time": now.clone()
-            }
-        });
-
-        krustjobs
-            .patch_status(
-                &cj.metadata.name.as_ref().unwrap_or_else(|| &default_name),
-                &pp,
-                &Patch::Merge(&data),
-            )
-            .await?;
-        return Ok(ReconcilerAction {
-            requeue_after: Some(convert_duration(next_time - now.0)?),
-        });
-    }
-
-    let job = construct_job_for_cronjob(&cj, Time(next_time))?;
-    let pp = PostParams::default();
-    let jobs = Api::<Job>::namespaced(
-        ctx.get_ref().client.clone(),
-        &cj.metadata.namespace.as_ref().unwrap(),
-    );
-    jobs.create(&pp, &job).await?;
-
-    status.last_schedule_time = Some(now.clone());
     let pp = PatchParams::default();
     let data = serde_json::json!({
         "status": {
             "last_schedule_time": now.clone()
         }
     });
-
+    let krustjobs = Api::<KrustJob>::namespaced(
+        ctx.get_ref().client.clone(),
+        &cj.metadata.namespace.as_ref().unwrap(),
+    );
     krustjobs
         .patch_status(
             &cj.metadata.name.as_ref().unwrap_or_else(|| &default_name),
@@ -116,6 +78,34 @@ async fn reconcile(cj: KrustJob, ctx: Context<Data>) -> Result<ReconcilerAction,
             &Patch::Merge(&data),
         )
         .await?;
+    Ok(result)
+}
+
+async fn reconcile_job(
+    cj: &KrustJob,
+    client: kube::Client,
+    now: Time,
+) -> Result<ReconcilerAction, Error> {
+    // when schedule comes, create a job.
+    // and update status
+    let schedule = Schedule::from_str(&cj.spec.schedule)?;
+    let mut status = cj.status.clone().unwrap_or(KrustJobStatus::default());
+    let last_schedule_time = status.last_schedule_time.as_ref().unwrap_or(&now);
+    let mut it = schedule.after(&last_schedule_time.0);
+    let next_time = it.next().unwrap();
+
+    if next_time > now.0 {
+        return Ok(ReconcilerAction {
+            requeue_after: Some(convert_duration(next_time - now.0)?),
+        });
+    }
+
+    let job = construct_job_for_cronjob(&cj, Time(next_time))?;
+    let pp = PostParams::default();
+    let jobs = Api::<Job>::namespaced(client, &cj.metadata.namespace.as_ref().unwrap());
+    jobs.create(&pp, &job).await?;
+
+    status.last_schedule_time = Some(now.clone());
     let next_time = it.next().unwrap();
 
     Ok(ReconcilerAction {
