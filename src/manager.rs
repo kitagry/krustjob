@@ -17,6 +17,22 @@ use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::time::Duration;
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub enum ConcurrencyPolicy {
+    /// allows CronJobs to run concurrently
+    Allow,
+    /// forbids concurrent runs, skipping next run if previous run hasn't finished yet
+    Forbid,
+    /// cancels currently running job and replaces it with a new one
+    Replace,
+}
+
+impl Default for ConcurrencyPolicy {
+    fn default() -> Self {
+        ConcurrencyPolicy::Allow
+    }
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, JsonSchema)]
 struct JobTemplate {
     spec: JobSpec,
@@ -39,6 +55,10 @@ pub struct KrustJobSpec {
 
     /// Specifies the job that will be created when executing a CronJob.
     job_template: JobTemplate,
+
+    /// Specifies hos to treat concurrent executions of a job
+    #[schemars(default)]
+    concurrency_policy: ConcurrencyPolicy,
 }
 
 /// CronJobStatus defines the observed state of CronJob
@@ -99,22 +119,60 @@ async fn reconcile_job(
         });
     }
 
-    let job = construct_job_for_cronjob(&cj, Time(next_time))?;
-    let pp = PostParams::default();
     let jobs = Api::<Job>::namespaced(client, &cj.metadata.namespace.as_ref().unwrap());
-    jobs.create(&pp, &job).await?;
+    let lp = ListParams::default().labels(
+        &format!(
+            "kitagry.github.io.krustjob/name={}",
+            cj.metadata.name.as_ref().unwrap()
+        )
+        .to_string(),
+    );
+    let job_list = jobs.list(&lp).await?;
+    let active_job_list: Vec<&Job> = job_list
+        .iter()
+        .filter(|j| {
+            let (finished, _) = is_job_finished(j);
+            !finished
+        })
+        .collect();
 
     status.last_schedule_time = Some(now.clone());
     let next_time = it.next().unwrap();
-
-    Ok(ReconcilerAction {
+    let result = Ok(ReconcilerAction {
         requeue_after: Some(convert_duration(next_time - now.0)?),
-    })
+    });
+
+    if cj.spec.concurrency_policy == ConcurrencyPolicy::Forbid && active_job_list.len() > 0 {
+        return result;
+    }
+
+    let job = construct_job_for_cronjob(&cj, Time(next_time))?;
+    let pp = PostParams::default();
+    jobs.create(&pp, &job).await?;
+
+    result
 }
 
 fn convert_duration(d: chrono::Duration) -> Result<std::time::Duration, Error> {
     d.to_std()
         .or_else(|e| Err(Error::ScheduleError(format!("schedule error: {}", e))))
+}
+
+fn is_job_finished(job: &Job) -> (bool, String) {
+    for c in job
+        .status
+        .as_ref()
+        .unwrap()
+        .conditions
+        .as_ref()
+        .unwrap_or(&vec![])
+        .iter()
+    {
+        if (c.type_ == "Complete" || c.type_ == "Failed") && c.status == "True" {
+            return (true, c.type_.clone());
+        }
+    }
+    return (false, "".to_string());
 }
 
 fn construct_job_for_cronjob(cj: &KrustJob, scheduled_time: Time) -> Result<Job, Error> {
@@ -132,11 +190,17 @@ fn construct_job_for_cronjob(cj: &KrustJob, scheduled_time: Time) -> Result<Job,
 
     let owner_references = object_to_owner_reference::<KrustJob>(&cj.metadata)?;
 
+    let mut labels = cj.metadata.labels.clone().unwrap_or(BTreeMap::new());
+    labels.insert(
+        "kitagry.github.io.krustjob/name".to_string(),
+        cj.metadata.name.as_ref().unwrap().clone(),
+    );
+
     Ok(Job {
         metadata: ObjectMeta {
             namespace: cj.metadata.namespace.clone(),
             name: Some(name),
-            labels: cj.metadata.labels.clone(),
+            labels: Some(labels),
             annotations: Some(annotations),
             owner_references: Some(vec![owner_references]),
             ..Default::default()
@@ -166,7 +230,8 @@ fn object_to_owner_reference<K: Resource<DynamicType = ()>>(
                 name: ".metadata.uid",
             })?
             .to_string(),
-        ..OwnerReference::default()
+        controller: Some(true),
+        block_owner_deletion: Some(true),
     })
 }
 
