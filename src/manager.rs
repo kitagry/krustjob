@@ -59,6 +59,15 @@ pub struct KrustJobSpec {
     /// Specifies hos to treat concurrent executions of a job
     #[schemars(default)]
     concurrency_policy: ConcurrencyPolicy,
+
+    /// The number of successful finished jobs to retain.
+    /// This is a pointer to distinguish between explicit zero and not specified
+    #[schemars(range(min = 0), default)]
+    successful_jobs_history_limit: usize,
+
+    /// The number of failed finished jobs to retain.
+    /// This is a pointer to distinguish between explicit zero and not specified.
+    failed_jobs_history_limit: Option<usize>,
 }
 
 /// CronJobStatus defines the observed state of CronJob
@@ -128,6 +137,7 @@ async fn reconcile_job(
         .to_string(),
     );
     let job_list = jobs.list(&lp).await?;
+    let job_list = job_list.items;
     let active_job_list: Vec<&Job> = job_list
         .iter()
         .filter(|j| {
@@ -135,6 +145,7 @@ async fn reconcile_job(
             !finished
         })
         .collect();
+    delete_history(&jobs, cj, &job_list).await?;
 
     status.last_schedule_time = Some(now.clone());
     let next_time = it.next().unwrap();
@@ -147,12 +158,7 @@ async fn reconcile_job(
     }
 
     if cj.spec.concurrency_policy == ConcurrencyPolicy::Replace {
-        let mut dp = DeleteParams::default();
-        dp.propagation_policy = Some(PropagationPolicy::Background);
-        for job in active_job_list {
-            jobs.delete(job.metadata.name.as_ref().unwrap(), &dp)
-                .await?;
-        }
+        delete_jobs(&jobs, active_job_list).await?;
     }
 
     let job = construct_job_for_cronjob(&cj, Time(next_time))?;
@@ -165,6 +171,69 @@ async fn reconcile_job(
 fn convert_duration(d: chrono::Duration) -> Result<std::time::Duration, Error> {
     d.to_std()
         .or_else(|e| Err(Error::ScheduleError(format!("schedule error: {}", e))))
+}
+
+async fn delete_history(jobs: &Api<Job>, cj: &KrustJob, job_list: &Vec<Job>) -> Result<(), Error> {
+    let mut successful_job_list: Vec<&Job> = job_list
+        .iter()
+        .filter(|j| {
+            let (finished, type_) = is_job_finished(j);
+            finished && type_ == "Complete"
+        })
+        .collect();
+
+    let successful_jobs_history_limit = cj.spec.successful_jobs_history_limit;
+    if successful_job_list.len() > successful_jobs_history_limit {
+        successful_job_list.sort_by(|a, b| {
+            b.status
+                .as_ref()
+                .unwrap()
+                .start_time
+                .as_ref()
+                .unwrap()
+                .cmp(&a.status.as_ref().unwrap().start_time.as_ref().unwrap())
+        });
+        delete_jobs(
+            jobs,
+            successful_job_list[cj.spec.successful_jobs_history_limit..].to_vec(),
+        )
+        .await?;
+    }
+
+    if cj.spec.failed_jobs_history_limit.is_some() {
+        let failed_job_history_limit = cj.spec.failed_jobs_history_limit.unwrap();
+        let mut failed_job_list: Vec<&Job> = job_list
+            .iter()
+            .filter(|j| {
+                let (finished, type_) = is_job_finished(j);
+                finished && type_ == "Failed"
+            })
+            .collect();
+        if failed_job_list.len() > failed_job_history_limit {
+            failed_job_list.sort_by(|a, b| {
+                b.status
+                    .as_ref()
+                    .unwrap()
+                    .start_time
+                    .as_ref()
+                    .unwrap()
+                    .cmp(&a.status.as_ref().unwrap().start_time.as_ref().unwrap())
+            });
+            delete_jobs(jobs, failed_job_list[failed_job_history_limit..].to_vec()).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn delete_jobs(jobs: &Api<Job>, job_list: Vec<&Job>) -> Result<(), Error> {
+    let mut dp = DeleteParams::default();
+    dp.propagation_policy = Some(PropagationPolicy::Background);
+    for job in job_list {
+        jobs.delete(job.metadata.name.as_ref().unwrap(), &dp)
+            .await?;
+    }
+    Ok(())
 }
 
 fn is_job_finished(job: &Job) -> (bool, String) {
