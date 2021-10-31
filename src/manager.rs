@@ -163,7 +163,18 @@ async fn reconcile_job(
     }
 
     status.last_schedule_time = Some(now.clone());
-    let next_time = it.next().unwrap();
+    let mut next_time = it.next().unwrap();
+    let mut missed_count = 0;
+    loop {
+        if next_time > now.0 {
+            break;
+        }
+        next_time = it.next().unwrap();
+        missed_count += 1;
+        if missed_count > 100 {
+            return Err(Error::ScheduleError("Too many missed start times (> 100). Set or decrease .spec.startingDeadlineSeconds or check clock skew.".to_string()));
+        }
+    }
     let result = Ok(ReconcilerAction {
         requeue_after: Some(convert_duration(next_time - now.0)?),
     });
@@ -197,8 +208,12 @@ async fn reconcile_job(
 }
 
 fn convert_duration(d: chrono::Duration) -> Result<std::time::Duration, Error> {
-    d.to_std()
-        .or_else(|e| Err(Error::ScheduleError(format!("schedule error: {}", e))))
+    d.to_std().or_else(|e| {
+        Err(Error::ScheduleError(format!(
+            "convert duration error: {}",
+            e
+        )))
+    })
 }
 
 async fn delete_history(jobs: &Api<Job>, cj: &KrustJob, job_list: &Vec<Job>) -> Result<(), Error> {
