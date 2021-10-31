@@ -56,6 +56,11 @@ pub struct KrustJobSpec {
     /// Specifies the job that will be created when executing a CronJob.
     job_template: JobTemplate,
 
+    /// This flag tells the controller to suspend subsequent executions, it does
+    /// not apply to already started executions.
+    #[schemars(default)]
+    suspend: bool,
+
     /// Specifies hos to treat concurrent executions of a job
     #[schemars(default)]
     concurrency_policy: ConcurrencyPolicy,
@@ -68,6 +73,10 @@ pub struct KrustJobSpec {
     /// The number of failed finished jobs to retain.
     /// This is a pointer to distinguish between explicit zero and not specified.
     failed_jobs_history_limit: Option<usize>,
+
+    /// Optional deadline in seconds for starting the job if it misses scheduled
+    /// time for any reason. Missed jobs executions will be counted as failed ones.
+    starting_deadline_seconds: Option<i64>,
 }
 
 /// CronJobStatus defines the observed state of CronJob
@@ -147,11 +156,30 @@ async fn reconcile_job(
         .collect();
     delete_history(&jobs, cj, &job_list).await?;
 
+    if cj.spec.suspend {
+        return Ok(ReconcilerAction {
+            requeue_after: None,
+        });
+    }
+
     status.last_schedule_time = Some(now.clone());
     let next_time = it.next().unwrap();
     let result = Ok(ReconcilerAction {
         requeue_after: Some(convert_duration(next_time - now.0)?),
     });
+
+    let too_late = if cj.spec.starting_deadline_seconds.is_some() {
+        next_time + chrono::Duration::seconds(cj.spec.starting_deadline_seconds.unwrap())
+            < Utc::now()
+    } else {
+        false
+    };
+
+    if too_late {
+        // TODO: publish events to fail to create Job in starting_deadline_seconds.
+        println!("failed to create job in startingDeadlineSeconds");
+        return result;
+    }
 
     if cj.spec.concurrency_policy == ConcurrencyPolicy::Forbid && active_job_list.len() > 0 {
         return result;
@@ -174,17 +202,39 @@ fn convert_duration(d: chrono::Duration) -> Result<std::time::Duration, Error> {
 }
 
 async fn delete_history(jobs: &Api<Job>, cj: &KrustJob, job_list: &Vec<Job>) -> Result<(), Error> {
-    let mut successful_job_list: Vec<&Job> = job_list
+    let successful_job_list: Vec<&Job> = job_list
         .iter()
         .filter(|j| {
             let (finished, type_) = is_job_finished(j);
             finished && type_ == "Complete"
         })
         .collect();
-
     let successful_jobs_history_limit = cj.spec.successful_jobs_history_limit;
-    if successful_job_list.len() > successful_jobs_history_limit {
-        successful_job_list.sort_by(|a, b| {
+    delete_jobs_with_history_limit(jobs, successful_job_list, successful_jobs_history_limit)
+        .await?;
+
+    if cj.spec.failed_jobs_history_limit.is_some() {
+        let failed_job_history_limit = cj.spec.failed_jobs_history_limit.unwrap();
+        let failed_job_list: Vec<&Job> = job_list
+            .iter()
+            .filter(|j| {
+                let (finished, type_) = is_job_finished(j);
+                finished && type_ == "Failed"
+            })
+            .collect();
+        delete_jobs_with_history_limit(jobs, failed_job_list, failed_job_history_limit).await?;
+    }
+
+    Ok(())
+}
+
+async fn delete_jobs_with_history_limit(
+    jobs: &Api<Job>,
+    mut job_list: Vec<&Job>,
+    history_limit: usize,
+) -> Result<(), Error> {
+    if job_list.len() > history_limit {
+        job_list.sort_by(|a, b| {
             b.status
                 .as_ref()
                 .unwrap()
@@ -193,36 +243,8 @@ async fn delete_history(jobs: &Api<Job>, cj: &KrustJob, job_list: &Vec<Job>) -> 
                 .unwrap()
                 .cmp(&a.status.as_ref().unwrap().start_time.as_ref().unwrap())
         });
-        delete_jobs(
-            jobs,
-            successful_job_list[cj.spec.successful_jobs_history_limit..].to_vec(),
-        )
-        .await?;
+        delete_jobs(jobs, job_list[history_limit..].to_vec()).await?;
     }
-
-    if cj.spec.failed_jobs_history_limit.is_some() {
-        let failed_job_history_limit = cj.spec.failed_jobs_history_limit.unwrap();
-        let mut failed_job_list: Vec<&Job> = job_list
-            .iter()
-            .filter(|j| {
-                let (finished, type_) = is_job_finished(j);
-                finished && type_ == "Failed"
-            })
-            .collect();
-        if failed_job_list.len() > failed_job_history_limit {
-            failed_job_list.sort_by(|a, b| {
-                b.status
-                    .as_ref()
-                    .unwrap()
-                    .start_time
-                    .as_ref()
-                    .unwrap()
-                    .cmp(&a.status.as_ref().unwrap().start_time.as_ref().unwrap())
-            });
-            delete_jobs(jobs, failed_job_list[failed_job_history_limit..].to_vec()).await?;
-        }
-    }
-
     Ok(())
 }
 
