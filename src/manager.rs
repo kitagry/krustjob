@@ -56,6 +56,11 @@ pub struct KrustJobSpec {
     /// Specifies the job that will be created when executing a CronJob.
     job_template: JobTemplate,
 
+    /// This flag tells the controller to suspend subsequent executions, it does
+    /// not apply to already started executions.
+    #[schemars(default)]
+    suspend: bool,
+
     /// Specifies hos to treat concurrent executions of a job
     #[schemars(default)]
     concurrency_policy: ConcurrencyPolicy,
@@ -150,6 +155,12 @@ async fn reconcile_job(
         })
         .collect();
     delete_history(&jobs, cj, &job_list).await?;
+
+    if cj.spec.suspend {
+        return Ok(ReconcilerAction {
+            requeue_after: None,
+        });
+    }
 
     status.last_schedule_time = Some(now.clone());
     let next_time = it.next().unwrap();
