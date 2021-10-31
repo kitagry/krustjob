@@ -177,6 +177,7 @@ async fn reconcile_job(
 
     if too_late {
         // TODO: publish events to fail to create Job in starting_deadline_seconds.
+        println!("failed to create job in startingDeadlineSeconds");
         return result;
     }
 
