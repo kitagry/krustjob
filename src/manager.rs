@@ -126,8 +126,21 @@ async fn reconcile_job(
 ) -> Result<ReconcilerAction, Error> {
     let schedule = Schedule::from_str(&cj.spec.schedule)?;
     let mut status = cj.status.clone().unwrap_or(KrustJobStatus::default());
-    let last_schedule_time = status.last_schedule_time.as_ref().unwrap_or(&now);
-    let mut it = schedule.after(&last_schedule_time.0);
+    let mut last_schedule_time = status
+        .last_schedule_time
+        .as_ref()
+        .unwrap_or(&cj.metadata.creation_timestamp.as_ref().unwrap_or(&now))
+        .0;
+
+    if cj.spec.starting_deadline_seconds.is_some() {
+        let scheduling_deadline =
+            now.0 - chrono::Duration::seconds(cj.spec.starting_deadline_seconds.unwrap());
+        if scheduling_deadline > last_schedule_time {
+            last_schedule_time = scheduling_deadline;
+        }
+    }
+
+    let mut it = schedule.after(&last_schedule_time);
     let next_time = it.next().unwrap();
 
     // scheduled time hasn't come yet.
@@ -163,7 +176,18 @@ async fn reconcile_job(
     }
 
     status.last_schedule_time = Some(now.clone());
-    let next_time = it.next().unwrap();
+    let mut next_time = it.next().unwrap();
+    let mut missed_count = 0;
+    loop {
+        if next_time > now.0 {
+            break;
+        }
+        next_time = it.next().unwrap();
+        missed_count += 1;
+        if missed_count > 100 {
+            return Err(Error::ScheduleError("Too many missed start times (> 100). Set or decrease .spec.startingDeadlineSeconds or check clock skew.".to_string()));
+        }
+    }
     let result = Ok(ReconcilerAction {
         requeue_after: Some(convert_duration(next_time - now.0)?),
     });
@@ -197,8 +221,12 @@ async fn reconcile_job(
 }
 
 fn convert_duration(d: chrono::Duration) -> Result<std::time::Duration, Error> {
-    d.to_std()
-        .or_else(|e| Err(Error::ScheduleError(format!("schedule error: {}", e))))
+    d.to_std().or_else(|e| {
+        Err(Error::ScheduleError(format!(
+            "convert duration error: {}",
+            e
+        )))
+    })
 }
 
 async fn delete_history(jobs: &Api<Job>, cj: &KrustJob, job_list: &Vec<Job>) -> Result<(), Error> {
@@ -349,13 +377,19 @@ impl Manager {
             client: client.clone(),
         });
 
-        let cronjobs = Api::<KrustJob>::all(client);
+        let cronjobs = Api::<KrustJob>::all(client.clone());
         let _r = cronjobs.list(&ListParams::default().limit(1)).await.expect(
             "is the crd installed? please run: cargo run --bin crdgen | kubectl apply -f -",
         );
 
         // All good. Start controller and return its future.
-        let drainer = Controller::new(cronjobs, ListParams::default())
+        let jobs = Api::<Job>::all(client.clone());
+        let controller = Controller::new(cronjobs, ListParams::default()).owns_with(
+            jobs,
+            (),
+            ListParams::default(),
+        );
+        let drainer = controller
             .run(reconcile, error_policy, context)
             .filter_map(|x| async move { std::result::Result::ok(x) })
             .for_each(|_| futures::future::ready(()))
